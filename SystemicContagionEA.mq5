@@ -29,7 +29,7 @@
 //|  tested thoroughly before any live use.                            |
 //+------------------------------------------------------------------+
 #property copyright "Educational / research use"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 //====================================================================
@@ -43,8 +43,11 @@ input double InpBarrierATRMult  = 3.0;         // Distress barrier = price -/+ A
 input int    InpATRPeriod       = 14;          // ATR period for the barrier distance
 input double InpContagionBlend  = 0.35;        // Weight given to neighbors in fixed-point update (0-1)
 input int    InpFixedPointIters = 25;          // Number of Picard iterations for the contagion map
-input double InpShortHorizonDays= 5.0;         // Short maturity, in trading days (~1 week)
-input double InpLongHorizonDays = 60.0;        // Long maturity, in trading days (~1 quarter)
+input int    InpNetworkHorizonBars = 24;       // Horizon (in InpTF bars) for the network survival gate (default: 24 H1 bars ~ 1 day)
+input double InpBarsPerDay      = 24.0;        // Approx. InpTF bars per trading day (H1 -> 24, H4 -> 6, D1 -> 1)
+input double InpShortHorizonDays= 5.0;         // Short maturity, in trading days (~1 week) -- converted to bars internally
+input double InpLongHorizonDays = 60.0;        // Long maturity, in trading days (~1 quarter) -- converted to bars internally
+input bool   InpUseEstimatedDrift = false;     // If false (recommended), survival probs assume zero drift -- far more stable than a noisy sample mean
 input double InpMinNetworkSurv  = 0.55;        // Below this network survival prob -> no new trades
 input double InpBaseLot         = 0.10;        // Base lot size before distress adjustment
 input double InpBaseStopPips    = 30.0;        // Base stop-loss distance in pips before adjustment
@@ -59,12 +62,17 @@ input int    InpMaxDistressCap  = 3;           // Cap on distress multiplier (1.
 //====================================================================
 string   g_symbols[];
 int      g_nSymbols = 0;
-double   g_corr[][];          // correlation matrix (exposure network)
-double   g_ownSurv[];         // each symbol's own barrier survival probability
-double   g_netSurv[];         // network-adjusted (contagion) survival probability
-double   g_barrier[];         // distress barrier level per symbol
-double   g_vol[];             // annualized-ish volatility per symbol
-double   g_drift[];           // drift per symbol
+
+double   g_corr[];             // flattened n x n correlation matrix: g_corr[i*n+j]
+double   g_ownSurv[];           // each symbol's own barrier survival probability
+double   g_netSurv[];           // network-adjusted (contagion) survival probability
+double   g_barrier[];           // distress barrier level per symbol
+double   g_vol[];               // per-bar return volatility per symbol
+double   g_drift[];             // per-bar return drift per symbol
+
+int      g_atrHandles[];        // one ATR handle per basket symbol
+int      g_maFastHandle = INVALID_HANDLE;   // fast MA handle, chart symbol only
+int      g_maSlowHandle = INVALID_HANDLE;   // slow MA handle, chart symbol only
 
 int      g_thisSymbolIndex = -1;
 
@@ -83,34 +91,70 @@ double NormalCDF(double x)
 
 //+------------------------------------------------------------------+
 //| Black-Cox style barrier survival probability                       |
-//| Probability price stays above 'barrier' over horizon T (years)     |
+//|                                                                    |
+//| Probability that a log-price process X_t = ln(price) + drift*t     |
+//| + vol*W_t never falls to ln(barrier) over horizon T.                |
+//|                                                                    |
+//| IMPORTANT UNIT CONVENTION: 'vol' and 'drift' must be estimated in   |
+//| the SAME time unit as 'T' (here: per bar of InpTF, with T expressed |
+//| as a number of bars). Mixing a per-bar vol with a T expressed in    |
+//| years (or vice versa) makes d_A/d_B blow up and the result          |
+//| degenerate to 0 or 1 almost everywhere -- that was the bug in the   |
+//| earlier version of this EA.                                        |
+//|                                                                    |
+//| Closed form (standard Brownian-motion-with-drift reflection         |
+//| identity, equivalent to the barrier term used in Black & Cox 1976   |
+//| and referenced in Feinstein & Sojmark, Remark 2.6):                 |
+//|                                                                    |
+//|   d_A = (lnRatio + drift*T) / (vol*sqrt(T))                         |
+//|   d_B = (-lnRatio + drift*T) / (vol*sqrt(T))                        |
+//|   survival = N(d_A) - (barrier/price)^(2*drift/vol^2) * N(d_B)      |
+//|                                                                    |
+//| where lnRatio = ln(price/barrier) > 0. With drift = 0 this reduces  |
+//| to the classic reflection-principle result 2*N(a)-1.                |
 //+------------------------------------------------------------------+
 double SurvivalProbability(double price, double barrier, double vol,
                             double drift, double T)
 {
    if(barrier >= price || vol <= 0.0 || T <= 0.0) return 0.0;
 
-   double lnRatio  = MathLog(price/barrier);
-   double sqrtT    = MathSqrt(T);
-   double d1 = (lnRatio + (drift + 0.5*vol*vol)*T) / (vol*sqrtT);
-   double d2 = (lnRatio - (drift - 0.5*vol*vol)*T) / (vol*sqrtT);
+   double lnRatio = MathLog(price/barrier);
+   double sqrtT   = MathSqrt(T);
 
-   double nd1 = NormalCDF(d1);
-   double exponent = 2.0*drift/(vol*vol);
-   double correction = MathPow(barrier/price, exponent) * NormalCDF(d2);
+   double dA = (lnRatio + drift*T) / (vol*sqrtT);
+   double dB = (-lnRatio + drift*T) / (vol*sqrtT);
 
-   double survival = nd1 - correction;
+   double nA = NormalCDF(dA);
+   double nB = NormalCDF(dB);
+
+   double survival;
+   if(MathAbs(drift) < 1e-12)
+   {
+      // Zero-drift case: exponent is 0, correction term is exactly 1.
+      survival = nA - nB;
+   }
+   else
+   {
+      double exponent  = 2.0*drift/(vol*vol);
+      double correction = MathPow(barrier/price, exponent) * nB;
+      survival = nA - correction;
+   }
+
    return MathMax(0.0, MathMin(1.0, survival));
 }
 
 //+------------------------------------------------------------------+
-//| Split comma-separated symbol string into array                     |
+//| Split comma-separated symbol string into array, trimmed            |
 //+------------------------------------------------------------------+
 void SplitSymbols(string list, string &out[])
 {
-   int n = StringSplit(list, ',', out);
+   ushort sep = StringGetCharacter(",", 0);
+   int n = StringSplit(list, sep, out);
    for(int i=0; i<n; i++)
-      StringTrimLeft(out[i]), StringTrimRight(out[i]);
+   {
+      StringTrimLeft(out[i]);
+      StringTrimRight(out[i]);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -142,6 +186,22 @@ bool EstimateVolDrift(string sym, int lookback, double &volOut, double &driftOut
 }
 
 //+------------------------------------------------------------------+
+//| Log-return series for one symbol (used to build the correlations)  |
+//+------------------------------------------------------------------+
+bool GetLogReturns(string sym, int lookback, double &retOut[])
+{
+   double closes[];
+   ArraySetAsSeries(closes, true);
+   int copied = CopyClose(sym, InpTF, 0, lookback+2, closes);
+   if(copied < lookback+2) return false;
+
+   ArrayResize(retOut, lookback);
+   for(int b=0; b<lookback; b++)
+      retOut[b] = MathLog(closes[b]/closes[b+1]);
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Pearson correlation between two return series                      |
 //+------------------------------------------------------------------+
 double PearsonCorrelation(const double &a[], const double &b[], int n)
@@ -163,33 +223,44 @@ double PearsonCorrelation(const double &a[], const double &b[], int n)
 }
 
 //+------------------------------------------------------------------+
-//| Build the exposure (correlation) network across the basket         |
+//| Build the exposure (correlation) network across the basket.        |
+//| Stored as a flattened n x n array: g_corr[i*n + j].                 |
+//| (MQL5 only supports a dynamic FIRST dimension, so a true double     |
+//|  corr[][] cannot be resized at runtime -- flattening avoids that.)  |
 //+------------------------------------------------------------------+
 bool BuildCorrelationMatrix(int lookback)
 {
-   double retMatrix[][];
-   ArrayResize(retMatrix, g_nSymbols);
+   int n = g_nSymbols;
+   ArrayResize(g_corr, n*n);
 
-   for(int i=0; i<g_nSymbols; i++)
+   // Cache each symbol's return series in a flattened buffer:
+   // symbol i occupies allReturns[i*lookback .. i*lookback+lookback-1]
+   double allReturns[];
+   ArrayResize(allReturns, n*lookback);
+
+   for(int i=0; i<n; i++)
    {
-      double closes[];
-      ArraySetAsSeries(closes, true);
-      int copied = CopyClose(g_symbols[i], InpTF, 0, lookback+2, closes);
-      if(copied < lookback+2) return false;
-
-      ArrayResize(retMatrix[i], lookback);
+      double tmp[];
+      if(!GetLogReturns(g_symbols[i], lookback, tmp)) return false;
       for(int b=0; b<lookback; b++)
-         retMatrix[i][b] = MathLog(closes[b]/closes[b+1]);
+         allReturns[i*lookback+b] = tmp[b];
    }
 
-   ArrayResize(g_corr, g_nSymbols);
-   for(int i=0; i<g_nSymbols; i++)
+   for(int i=0; i<n; i++)
    {
-      ArrayResize(g_corr[i], g_nSymbols);
-      for(int j=0; j<g_nSymbols; j++)
+      for(int j=0; j<n; j++)
       {
-         if(i==j) { g_corr[i][j] = 1.0; continue; }
-         g_corr[i][j] = PearsonCorrelation(retMatrix[i], retMatrix[j], lookback);
+         if(i==j) { g_corr[i*n+j] = 1.0; continue; }
+
+         double a[], b[];
+         ArrayResize(a, lookback);
+         ArrayResize(b, lookback);
+         for(int k=0; k<lookback; k++)
+         {
+            a[k] = allReturns[i*lookback+k];
+            b[k] = allReturns[j*lookback+k];
+         }
+         g_corr[i*n+j] = PearsonCorrelation(a, b, lookback);
       }
    }
    return true;
@@ -200,21 +271,22 @@ bool BuildCorrelationMatrix(int lookback)
 //+------------------------------------------------------------------+
 void ContagionFixedPoint()
 {
-   ArrayResize(g_netSurv, g_nSymbols);
+   int n = g_nSymbols;
+   ArrayResize(g_netSurv, n);
    ArrayCopy(g_netSurv, g_ownSurv);
 
    double tmp[];
-   ArrayResize(tmp, g_nSymbols);
+   ArrayResize(tmp, n);
 
    for(int it=0; it<InpFixedPointIters; it++)
    {
-      for(int i=0; i<g_nSymbols; i++)
+      for(int i=0; i<n; i++)
       {
          double weightedNeighbor = 0.0, weightSum = 0.0;
-         for(int j=0; j<g_nSymbols; j++)
+         for(int j=0; j<n; j++)
          {
             if(j==i) continue;
-            double w = MathAbs(g_corr[i][j]); // |correlation| plays the role of L_ij exposure
+            double w = MathAbs(g_corr[i*n+j]); // |correlation| plays the role of L_ij exposure
             weightedNeighbor += w * g_netSurv[j];
             weightSum        += w;
          }
@@ -223,6 +295,19 @@ void ContagionFixedPoint()
       }
       ArrayCopy(g_netSurv, tmp);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Read current ATR value for basket symbol idx (via handle+buffer)   |
+//+------------------------------------------------------------------+
+double GetATRValue(int idx)
+{
+   if(g_atrHandles[idx] == INVALID_HANDLE) return 0.0;
+
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(g_atrHandles[idx], 0, 0, 1, buf) <= 0) return 0.0;
+   return buf[0];
 }
 
 //+------------------------------------------------------------------+
@@ -242,14 +327,18 @@ bool RefreshNetworkState()
       g_vol[i]   = vol;
       g_drift[i] = drift;
 
-      double atr = iATR(g_symbols[i], InpTF, InpATRPeriod, 0);
+      double atr = GetATRValue(i);
+      if(atr <= 0.0) return false;
+
       double price = SymbolInfoDouble(g_symbols[i], SYMBOL_BID);
       g_barrier[i] = price - InpBarrierATRMult * atr; // "capital-zero" analogue
 
-      // Horizon expressed in bars-as-years is a simplification: we use InpVolLookback
-      // bars as one unit of "time" so that T=1 corresponds to the estimation window.
-      double T = 1.0;
-      g_ownSurv[i] = SurvivalProbability(price, g_barrier[i], g_vol[i], g_drift[i], T);
+      // vol/drift are per-bar (InpTF) statistics, so the horizon T must also be
+      // expressed as a number of bars -- NOT years, NOT "1 window" -- for the
+      // formula's units to be consistent. See SurvivalProbability() header comment.
+      double T = (double)InpNetworkHorizonBars;
+      double effectiveDrift = InpUseEstimatedDrift ? g_drift[i] : 0.0;
+      g_ownSurv[i] = SurvivalProbability(price, g_barrier[i], g_vol[i], effectiveDrift, T);
    }
 
    if(!BuildCorrelationMatrix(InpCorrLookback)) return false;
@@ -270,16 +359,25 @@ double DistressMultiplier(double networkSurvivalProb)
 
 //+------------------------------------------------------------------+
 //| Term-structure inversion check for one symbol                      |
+//|                                                                    |
+//| vol/drift are per-InpTF-bar statistics, so both horizons are        |
+//| converted from "days" into "bars" via InpBarsPerDay before being    |
+//| passed into SurvivalProbability -- using T in years against a       |
+//| per-bar vol (the earlier bug) makes vol*sqrt(T) collapse to almost   |
+//| zero, saturating N(d) at 0/1 and reporting "inverted" on nearly      |
+//| every bar regardless of actual conditions.                          |
 //+------------------------------------------------------------------+
 bool IsTermStructureInverted(int idx)
 {
    double price = SymbolInfoDouble(g_symbols[idx], SYMBOL_BID);
 
-   double Tshort = InpShortHorizonDays / 252.0;
-   double Tlong  = InpLongHorizonDays  / 252.0;
+   double Tshort = MathMax(1.0, InpShortHorizonDays * InpBarsPerDay);
+   double Tlong  = MathMax(Tshort+1.0, InpLongHorizonDays * InpBarsPerDay);
 
-   double pShort = SurvivalProbability(price, g_barrier[idx], g_vol[idx], g_drift[idx], Tshort);
-   double pLong  = SurvivalProbability(price, g_barrier[idx], g_vol[idx], g_drift[idx], Tlong);
+   double drift = InpUseEstimatedDrift ? g_drift[idx] : 0.0;
+
+   double pShort = SurvivalProbability(price, g_barrier[idx], g_vol[idx], drift, Tshort);
+   double pLong  = SurvivalProbability(price, g_barrier[idx], g_vol[idx], drift, Tlong);
 
    if(pShort <= 0.0 || pLong <= 0.0) return true; // treat degenerate case as stressed
 
@@ -293,12 +391,19 @@ bool IsTermStructureInverted(int idx)
 //| Simple trend core signal (fast/slow MA) -- the "strategy" the      |
 //| risk engine is wrapped around. Swap this out freely.               |
 //+------------------------------------------------------------------+
-int TrendSignal(string sym)
+int TrendSignal()
 {
-   double maFast = iMA(sym, InpTF, InpMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double maSlow = iMA(sym, InpTF, InpMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double maFastPrev = iMA(sym, InpTF, InpMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
-   double maSlowPrev = iMA(sym, InpTF, InpMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+   if(g_maFastHandle == INVALID_HANDLE || g_maSlowHandle == INVALID_HANDLE) return 0;
+
+   double fastBuf[], slowBuf[];
+   ArraySetAsSeries(fastBuf, true);
+   ArraySetAsSeries(slowBuf, true);
+
+   if(CopyBuffer(g_maFastHandle, 0, 0, 2, fastBuf) < 2) return 0;
+   if(CopyBuffer(g_maSlowHandle, 0, 0, 2, slowBuf) < 2) return 0;
+
+   double maFast = fastBuf[0], maFastPrev = fastBuf[1];
+   double maSlow = slowBuf[0], maSlowPrev = slowBuf[1];
 
    if(maFastPrev <= maSlowPrev && maFast > maSlow) return 1;  // bullish cross
    if(maFastPrev >= maSlowPrev && maFast < maSlow) return -1; // bearish cross
@@ -338,8 +443,8 @@ void ExecuteTrade(string sym, int direction, double distressMult)
 {
    double pip = PipSize(sym);
    double lot = NormalizeDouble(InpBaseLot / distressMult, 2);
-   if(lot < SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN))
-      lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   if(lot < minLot) lot = minLot;
 
    double stopPips = InpBaseStopPips * distressMult; // widen stop under distress
    double tpPips   = InpBaseTPPips;                  // TP left unscaled (asymmetric by design)
@@ -349,23 +454,40 @@ void ExecuteTrade(string sym, int direction, double distressMult)
    double sl = (direction>0) ? price - stopPips*pip : price + stopPips*pip;
    double tp = (direction>0) ? price + tpPips*pip   : price - tpPips*pip;
 
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+
    MqlTradeRequest request;
    MqlTradeResult  result;
    ZeroMemory(request);
    ZeroMemory(result);
 
-   request.action    = TRADE_ACTION_DEAL;
-   request.symbol    = sym;
-   request.volume    = lot;
-   request.type      = (direction>0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   request.price     = price;
-   request.sl        = NormalizeDouble(sl, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
-   request.tp        = NormalizeDouble(tp, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
-   request.deviation = 10;
-   request.magic     = InpMagic;
-   request.comment   = "ContagionEA d="+DoubleToString(distressMult,2);
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = sym;
+   request.volume       = lot;
+   request.type         = (direction>0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   request.price        = price;
+   request.sl           = NormalizeDouble(sl, digits);
+   request.tp           = NormalizeDouble(tp, digits);
+   request.deviation    = 10;
+   request.magic        = InpMagic;
+   request.type_filling = ORDER_FILLING_FOK;
+   request.comment      = "ContagionEA d="+DoubleToString(distressMult,2);
 
-   OrderSend(request, result);
+   if(!OrderSend(request, result))
+      Print("SystemicContagionEA: OrderSend failed, error=", GetLastError(),
+            " retcode=", result.retcode);
+}
+
+//+------------------------------------------------------------------+
+//| Release all indicator handles                                      |
+//+------------------------------------------------------------------+
+void ReleaseHandles()
+{
+   for(int i=0; i<ArraySize(g_atrHandles); i++)
+      if(g_atrHandles[i] != INVALID_HANDLE) IndicatorRelease(g_atrHandles[i]);
+
+   if(g_maFastHandle != INVALID_HANDLE) IndicatorRelease(g_maFastHandle);
+   if(g_maSlowHandle != INVALID_HANDLE) IndicatorRelease(g_maSlowHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -396,10 +518,32 @@ int OnInit()
    for(int i=0; i<g_nSymbols; i++)
       SymbolSelect(g_symbols[i], true);
 
+   // --- Create one ATR handle per basket symbol ---
+   ArrayResize(g_atrHandles, g_nSymbols);
+   for(int i=0; i<g_nSymbols; i++)
+   {
+      g_atrHandles[i] = iATR(g_symbols[i], InpTF, InpATRPeriod);
+      if(g_atrHandles[i] == INVALID_HANDLE)
+      {
+         Print("SystemicContagionEA: failed to create ATR handle for ", g_symbols[i]);
+         return INIT_FAILED;
+      }
+   }
+
+   // --- Create fast/slow MA handles for the chart symbol only ---
+   g_maFastHandle = iMA(_Symbol, InpTF, InpMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_maSlowHandle = iMA(_Symbol, InpTF, InpMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_maFastHandle == INVALID_HANDLE || g_maSlowHandle == INVALID_HANDLE)
+   {
+      Print("SystemicContagionEA: failed to create MA handles.");
+      return INIT_FAILED;
+   }
+
    if(!RefreshNetworkState())
    {
-      Print("SystemicContagionEA: initial network state could not be built (insufficient history?).");
-      return INIT_FAILED;
+      Print("SystemicContagionEA: initial network state could not be built ",
+            "(insufficient history or indicators not ready yet -- will retry on next tick).");
+      // Not fatal: indicator buffers may simply not be filled yet on attach.
    }
 
    Print("SystemicContagionEA initialized on ", g_nSymbols, " symbols. Trading symbol index = ",
@@ -450,7 +594,7 @@ void OnTick()
    }
    if(HasOpenPosition(_Symbol)) return;
 
-   int signal = TrendSignal(_Symbol);
+   int signal = TrendSignal();
    if(signal != 0)
       ExecuteTrade(_Symbol, signal, distressMult);
 }
@@ -461,5 +605,6 @@ void OnTick()
 void OnDeinit(const int reason)
 {
    Comment("");
+   ReleaseHandles();
 }
 //+------------------------------------------------------------------+
