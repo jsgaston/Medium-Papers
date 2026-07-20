@@ -505,6 +505,21 @@ bool HasOpenPosition(string sym)
 }
 
 //+------------------------------------------------------------------+
+//| Pick a filling mode the symbol/broker actually supports. Hard-      |
+//| coding ORDER_FILLING_FOK breaks on brokers/symbols that only offer  |
+//| IOC or Return, which is exactly the "Unsupported filling mode"      |
+//| error. We read SYMBOL_FILLING_MODE and prefer FOK > IOC > RETURN.   |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetSupportedFilling(string sym)
+{
+   int mode = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+
+   if((mode & SYMBOL_FILLING_FOK) != 0)  return ORDER_FILLING_FOK;
+   if((mode & SYMBOL_FILLING_IOC) != 0)  return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN; // safest fallback, works even when the flags report nothing
+}
+
+//+------------------------------------------------------------------+
 //| Execute a market order sized and stopped according to distress     |
 //+------------------------------------------------------------------+
 void ExecuteTrade(string sym, int direction, double distressMult)
@@ -538,12 +553,25 @@ void ExecuteTrade(string sym, int direction, double distressMult)
    request.tp           = NormalizeDouble(tp, digits);
    request.deviation    = 10;
    request.magic        = InpMagic;
-   request.type_filling = ORDER_FILLING_FOK;
+   request.type_filling = GetSupportedFilling(sym);
    request.comment      = "ContagionEA d="+DoubleToString(distressMult,2);
 
    if(!OrderSend(request, result))
+   {
       Print("SystemicContagionEA: OrderSend failed, error=", GetLastError(),
-            " retcode=", result.retcode);
+            " retcode=", result.retcode, " filling=", EnumToString(request.type_filling));
+
+      // Fallback: if the chosen filling mode was still rejected, retry once with RETURN,
+      // which virtually every broker/symbol accepts.
+      if(request.type_filling != ORDER_FILLING_RETURN)
+      {
+         request.type_filling = ORDER_FILLING_RETURN;
+         ZeroMemory(result);
+         if(!OrderSend(request, result))
+            Print("SystemicContagionEA: retry with ORDER_FILLING_RETURN also failed, error=",
+                  GetLastError(), " retcode=", result.retcode);
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
