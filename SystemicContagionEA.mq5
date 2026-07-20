@@ -50,11 +50,14 @@ input double InpVolStressRatio   = 1.35;       // If recent/baseline vol ratio e
 input bool   InpUseEstimatedDrift = false;     // If false (recommended), survival probs assume zero drift -- far more stable than a noisy sample mean
 input double InpMinNetworkSurv   = 0.35;       // Below this network survival prob -> no new trades (was 0.55 -- too close to "normal" territory)
 input double InpBaseLot         = 0.10;        // Base lot size before distress adjustment
-input double InpBaseStopPips    = 30.0;        // Base stop-loss distance in pips before adjustment
-input double InpBaseTPPips      = 45.0;        // Base take-profit distance in pips
+input double InpStopATRMult     = 2.0;         // Stop-loss distance = current ATR * this multiple
+input double InpRewardRiskRatio = 1.5;         // Take-profit distance = stop distance * this ratio (kept CONSTANT regardless of distress -- only lot size shrinks under stress, not the trade's shape)
 input int    InpMagic           = 20260721;    // Magic number
-input int    InpMAFastPeriod    = 10;          // Simple trend filter: fast MA
-input int    InpMASlowPeriod    = 50;          // Simple trend filter: slow MA
+input int    InpMAFastPeriod    = 10;          // Entry trigger: fast MA
+input int    InpMASlowPeriod    = 50;          // Entry trigger: slow MA
+input bool   InpUseTrendFilter  = true;        // Only take entries aligned with the higher-timeframe trend (cuts whipsaw losses)
+input ENUM_TIMEFRAMES InpTrendFilterTF = PERIOD_D1; // Higher timeframe used for the trend filter
+input int    InpTrendFilterPeriod = 100;       // Trend filter MA period (on InpTrendFilterTF)
 input int    InpMaxDistressCap  = 3;           // Cap on distress multiplier (1..N)
 
 //====================================================================
@@ -73,6 +76,7 @@ double   g_drift[];             // per-bar return drift per symbol
 int      g_atrHandles[];        // one ATR handle per basket symbol
 int      g_maFastHandle = INVALID_HANDLE;   // fast MA handle, chart symbol only
 int      g_maSlowHandle = INVALID_HANDLE;   // slow MA handle, chart symbol only
+int      g_trendFilterHandle = INVALID_HANDLE; // higher-timeframe trend filter MA, chart symbol only
 
 int      g_thisSymbolIndex = -1;
 
@@ -479,13 +483,28 @@ int TrendSignal()
 }
 
 //+------------------------------------------------------------------+
-//| Pip size helper                                                     |
+//| Higher-timeframe trend filter: only allow entries in the direction  |
+//| of the dominant trend on InpTrendFilterTF (e.g. price above/below   |
+//| its D1 moving average). This is the single biggest lever against   |
+//| the steady equity bleed a plain MA-cross produces in choppy/        |
+//| ranging conditions: it stops the EA from repeatedly fading a         |
+//| bigger trend on every small H1 crossover.                            |
 //+------------------------------------------------------------------+
-double PipSize(string sym)
+bool TrendAligned(int direction)
 {
-   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-   return (digits==3 || digits==5) ? point*10.0 : point;
+   if(!InpUseTrendFilter) return true;
+   if(g_trendFilterHandle == INVALID_HANDLE) return true; // fail open rather than block everything
+
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(g_trendFilterHandle, 0, 0, 1, buf) < 1) return true;
+
+   double trendMA = buf[0];
+   double price   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(direction > 0) return (price > trendMA); // only buy above the higher-TF trend
+   if(direction < 0) return (price < trendMA); // only sell below the higher-TF trend
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -524,18 +543,27 @@ ENUM_ORDER_TYPE_FILLING GetSupportedFilling(string sym)
 //+------------------------------------------------------------------+
 void ExecuteTrade(string sym, int direction, double distressMult)
 {
-   double pip = PipSize(sym);
    double lot = NormalizeDouble(InpBaseLot / distressMult, 2);
    double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
    if(lot < minLot) lot = minLot;
 
-   double stopPips = InpBaseStopPips * distressMult; // widen stop under distress
-   double tpPips   = InpBaseTPPips;                  // TP left unscaled (asymmetric by design)
+   // Stop distance comes from REAL current ATR, not a fixed pip count -- this makes
+   // risk comparable across symbols/regimes. Distress only shrinks the lot size
+   // (InpBaseLot / distressMult above); it no longer touches SL/TP distance, so the
+   // trade's risk:reward shape stays constant whether the network is calm or stressed.
+   double atr = GetATRValue(g_thisSymbolIndex);
+   if(atr <= 0.0)
+   {
+      Print("SystemicContagionEA: ATR unavailable for ", sym, ", skipping trade this bar.");
+      return;
+   }
+   double stopDistance = atr * InpStopATRMult;
+   double tpDistance    = stopDistance * InpRewardRiskRatio;
 
    double price = (direction>0) ? SymbolInfoDouble(sym, SYMBOL_ASK)
                                  : SymbolInfoDouble(sym, SYMBOL_BID);
-   double sl = (direction>0) ? price - stopPips*pip : price + stopPips*pip;
-   double tp = (direction>0) ? price + tpPips*pip   : price - tpPips*pip;
+   double sl = (direction>0) ? price - stopDistance : price + stopDistance;
+   double tp = (direction>0) ? price + tpDistance   : price - tpDistance;
 
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
 
@@ -584,6 +612,7 @@ void ReleaseHandles()
 
    if(g_maFastHandle != INVALID_HANDLE) IndicatorRelease(g_maFastHandle);
    if(g_maSlowHandle != INVALID_HANDLE) IndicatorRelease(g_maSlowHandle);
+   if(g_trendFilterHandle != INVALID_HANDLE) IndicatorRelease(g_trendFilterHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -633,6 +662,17 @@ int OnInit()
    {
       Print("SystemicContagionEA: failed to create MA handles.");
       return INIT_FAILED;
+   }
+
+   // --- Create the higher-timeframe trend filter handle ---
+   if(InpUseTrendFilter)
+   {
+      g_trendFilterHandle = iMA(_Symbol, InpTrendFilterTF, InpTrendFilterPeriod, 0, MODE_SMA, PRICE_CLOSE);
+      if(g_trendFilterHandle == INVALID_HANDLE)
+      {
+         Print("SystemicContagionEA: failed to create trend-filter MA handle.");
+         return INIT_FAILED;
+      }
    }
 
    if(!RefreshNetworkState())
@@ -718,7 +758,7 @@ void OnTick()
    if(HasOpenPosition(_Symbol)) return;
 
    int signal = TrendSignal();
-   if(signal != 0)
+   if(signal != 0 && TrendAligned(signal))
       ExecuteTrade(_Symbol, signal, distressMult);
 }
 
