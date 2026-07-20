@@ -39,16 +39,16 @@ input string InpBasketSymbols   = "EURUSD,GBPUSD,AUDUSD,USDCHF,USDJPY"; // Netwo
 input ENUM_TIMEFRAMES InpTF     = PERIOD_H1;   // Timeframe for returns / volatility
 input int    InpVolLookback     = 100;         // Bars used to estimate volatility & drift
 input int    InpCorrLookback    = 100;         // Bars used to estimate correlation matrix
-input double InpBarrierATRMult  = 3.0;         // Distress barrier = price -/+ ATR * this multiple
+input double InpBarrierATRMult  = 6.0;         // Distress barrier = price -/+ ATR * this multiple (was 3.0 -- too tight, gave ~50% survival even in calm markets)
 input int    InpATRPeriod       = 14;          // ATR period for the barrier distance
 input double InpContagionBlend  = 0.35;        // Weight given to neighbors in fixed-point update (0-1)
 input int    InpFixedPointIters = 25;          // Number of Picard iterations for the contagion map
-input int    InpNetworkHorizonBars = 24;       // Horizon (in InpTF bars) for the network survival gate (default: 24 H1 bars ~ 1 day)
-input double InpBarsPerDay      = 24.0;        // Approx. InpTF bars per trading day (H1 -> 24, H4 -> 6, D1 -> 1)
-input double InpShortHorizonDays= 5.0;         // Short maturity, in trading days (~1 week) -- converted to bars internally
-input double InpLongHorizonDays = 60.0;        // Long maturity, in trading days (~1 quarter) -- converted to bars internally
+input int    InpNetworkHorizonBars = 12;       // Horizon (in InpTF bars) for the network survival gate
+input int    InpShortVolLookback = 20;         // "Recent" volatility window (bars) -- numerator of the stress ratio
+input int    InpLongVolLookback  = 200;        // "Baseline" volatility window (bars) -- denominator of the stress ratio
+input double InpVolStressRatio   = 1.35;       // If recent/baseline vol ratio exceeds this, treat the symbol as in a stressed regime
 input bool   InpUseEstimatedDrift = false;     // If false (recommended), survival probs assume zero drift -- far more stable than a noisy sample mean
-input double InpMinNetworkSurv  = 0.55;        // Below this network survival prob -> no new trades
+input double InpMinNetworkSurv   = 0.35;       // Below this network survival prob -> no new trades (was 0.55 -- too close to "normal" territory)
 input double InpBaseLot         = 0.10;        // Base lot size before distress adjustment
 input double InpBaseStopPips    = 30.0;        // Base stop-loss distance in pips before adjustment
 input double InpBaseTPPips      = 45.0;        // Base take-profit distance in pips
@@ -420,33 +420,39 @@ double DistressMultiplier(double networkSurvivalProb)
 }
 
 //+------------------------------------------------------------------+
-//| Term-structure inversion check for one symbol                      |
+//| Volatility-regime stress check (replaces the earlier               |
+//| "term structure inversion" attempt).                                |
 //|                                                                    |
-//| vol/drift are per-InpTF-bar statistics, so both horizons are        |
-//| converted from "days" into "bars" via InpBarsPerDay before being    |
-//| passed into SurvivalProbability -- using T in years against a       |
-//| per-bar vol (the earlier bug) makes vol*sqrt(T) collapse to almost   |
-//| zero, saturating N(d) at 0/1 and reporting "inverted" on nearly      |
-//| every bar regardless of actual conditions.                          |
+//| WHY THE ORIGINAL APPROACH WAS REPLACED: comparing a short-horizon   |
+//| vs. long-horizon barrier survival probability under a driftless     |
+//| random walk is structurally doomed to look "inverted" almost         |
+//| always. A zero-drift Brownian motion is recurrent -- it hits ANY     |
+//| fixed barrier with probability 1 given enough time -- so extending   |
+//| the same barrier out to a much longer horizon mechanically drives    |
+//| the long-horizon survival probability toward 0 regardless of         |
+//| whether the market is actually calm or stressed. That produced        |
+//| "inverted" on essentially every bar, which is a math artifact, not    |
+//| a market signal.                                                     |
+//|                                                                    |
+//| REPLACEMENT: compare RECENT realized volatility (short lookback,     |
+//| e.g. last 20 bars) to BASELINE realized volatility (long lookback,   |
+//| e.g. last 200 bars) for the same symbol. A ratio well above 1 means   |
+//| the market has gotten noticeably more volatile than its own recent   |
+//| history -- a direct, numerically robust proxy for the paper's         |
+//| volatility-clustering / down-market effect, without any horizon      |
+//| extrapolation blow-up.                                               |
 //+------------------------------------------------------------------+
-bool IsTermStructureInverted(int idx)
+bool IsVolatilityRegimeStressed(string sym, double &ratioOut)
 {
-   double price = SymbolInfoDouble(g_symbols[idx], SYMBOL_BID);
+   double volShort, driftShort, volLong, driftLong;
 
-   double Tshort = MathMax(1.0, InpShortHorizonDays * InpBarsPerDay);
-   double Tlong  = MathMax(Tshort+1.0, InpLongHorizonDays * InpBarsPerDay);
+   if(!EstimateVolDrift(sym, InpShortVolLookback, volShort, driftShort)) { ratioOut=1.0; return false; }
+   if(!EstimateVolDrift(sym, InpLongVolLookback,  volLong,  driftLong )) { ratioOut=1.0; return false; }
 
-   double drift = InpUseEstimatedDrift ? g_drift[idx] : 0.0;
+   if(volLong <= 0.0) { ratioOut=1.0; return false; }
 
-   double pShort = SurvivalProbability(price, g_barrier[idx], g_vol[idx], drift, Tshort);
-   double pLong  = SurvivalProbability(price, g_barrier[idx], g_vol[idx], drift, Tlong);
-
-   if(pShort <= 0.0 || pLong <= 0.0) return true; // treat degenerate case as stressed
-
-   double rShort = MathPow(pShort, -1.0/Tshort) - 1.0;
-   double rLong  = MathPow(pLong,  -1.0/Tlong ) - 1.0;
-
-   return (rShort > rLong);
+   ratioOut = volShort / volLong;
+   return (ratioOut > InpVolStressRatio);
 }
 
 //+------------------------------------------------------------------+
@@ -642,7 +648,8 @@ void OnTick()
 
    double mySurv       = g_ownSurv[g_thisSymbolIndex];
    double myNetSurv    = g_netSurv[g_thisSymbolIndex];
-   bool   inverted     = IsTermStructureInverted(g_thisSymbolIndex);
+   double volRatio     = 1.0;
+   bool   stressed      = IsVolatilityRegimeStressed(_Symbol, volRatio);
    double distressMult = DistressMultiplier(myNetSurv);
 
    Comment(StringFormat(
@@ -650,10 +657,10 @@ void OnTick()
       "Symbol: %s\n"
       "Own survival prob:      %.4f\n"
       "Network-adjusted prob:  %.4f\n"
-      "Term structure inverted: %s\n"
+      "Vol regime stressed:    %s (ratio %.2fx, threshold %.2fx)\n"
       "Distress multiplier:    %.2fx\n"
       "Min network threshold:  %.2f",
-      _Symbol, mySurv, myNetSurv, (inverted?"YES (stress)":"no"),
+      _Symbol, mySurv, myNetSurv, (stressed?"YES":"no"), volRatio, InpVolStressRatio,
       distressMult, InpMinNetworkSurv));
 
    // Periodic numeric snapshot in the Journal (not just Comment(), which the Strategy
@@ -662,7 +669,8 @@ void OnTick()
       Print("SystemicContagionEA: [", TimeToString(curBarTime), "] ", _Symbol,
             " ownSurv=", DoubleToString(mySurv,4),
             " netSurv=", DoubleToString(myNetSurv,4),
-            " inverted=", (inverted?"yes":"no"),
+            " volRatio=", DoubleToString(volRatio,2),
+            " stressed=", (stressed?"yes":"no"),
             " distressMult=", DoubleToString(distressMult,2));
 
    // --- Risk gate: paper's core message -- don't wait for an actual default ---
@@ -672,10 +680,11 @@ void OnTick()
             " below threshold ", InpMinNetworkSurv, " -- skipping new entries this bar.");
       return;
    }
-   if(inverted)
+   if(stressed)
    {
-      Print("SystemicContagionEA: term structure inverted for ", _Symbol,
-            " -- skipping new entries this bar.");
+      Print("SystemicContagionEA: volatility regime stressed for ", _Symbol,
+            " (ratio ", DoubleToString(volRatio,2), " > ", InpVolStressRatio,
+            ") -- skipping new entries this bar.");
       return;
    }
    if(HasOpenPosition(_Symbol)) return;
