@@ -158,6 +158,37 @@ void SplitSymbols(string list, string &out[])
 }
 
 //+------------------------------------------------------------------+
+//| One-time-per-symbol diagnostic: this is THE most common reason a   |
+//| multi-symbol EA silently never trades in the Strategy Tester --    |
+//| MT5 only guarantees local history for the chart's own symbol.      |
+//| Other basket symbols need their history downloaded in the terminal |
+//| (Market Watch -> right click symbol -> Symbols -> or just open a   |
+//| chart of each basket symbol and scroll back to the test start      |
+//| date at least once) BEFORE running the backtest.                   |
+//+------------------------------------------------------------------+
+bool g_warnedHistory[];
+
+void WarnInsufficientHistory(string sym, int copied, int needed)
+{
+   int idx = -1;
+   for(int i=0; i<g_nSymbols; i++)
+      if(g_symbols[i]==sym) idx=i;
+   if(idx<0) return;
+   if(idx < ArraySize(g_warnedHistory) && g_warnedHistory[idx]) return; // already warned once
+
+   if(idx >= ArraySize(g_warnedHistory)) ArrayResize(g_warnedHistory, g_nSymbols);
+   g_warnedHistory[idx] = true;
+
+   Print("SystemicContagionEA: NOT ENOUGH HISTORY for basket symbol '", sym,
+         "' at this point in the test -- got ", copied, " bars, needed ", needed,
+         ". This symbol's data is not yet loaded/available in the terminal for this ",
+         "period. The EA will keep skipping ALL entries until every basket symbol has ",
+         "enough history. Fix: open a chart for '", sym, "' in the terminal (not just the ",
+         "tester) and scroll/Ctrl+Home back to (or before) the backtest start date so MT5 ",
+         "downloads/caches the history, then re-run the test.");
+}
+
+//+------------------------------------------------------------------+
 //| Estimate log-return volatility (per bar) and drift for a symbol    |
 //+------------------------------------------------------------------+
 bool EstimateVolDrift(string sym, int lookback, double &volOut, double &driftOut)
@@ -165,7 +196,11 @@ bool EstimateVolDrift(string sym, int lookback, double &volOut, double &driftOut
    double closes[];
    ArraySetAsSeries(closes, true);
    int copied = CopyClose(sym, InpTF, 0, lookback+2, closes);
-   if(copied < lookback+2) return false;
+   if(copied < lookback+2)
+   {
+      WarnInsufficientHistory(sym, copied, lookback+2);
+      return false;
+   }
 
    double rets[];
    ArrayResize(rets, lookback);
@@ -193,7 +228,11 @@ bool GetLogReturns(string sym, int lookback, double &retOut[])
    double closes[];
    ArraySetAsSeries(closes, true);
    int copied = CopyClose(sym, InpTF, 0, lookback+2, closes);
-   if(copied < lookback+2) return false;
+   if(copied < lookback+2)
+   {
+      WarnInsufficientHistory(sym, copied, lookback+2);
+      return false;
+   }
 
    ArrayResize(retOut, lookback);
    for(int b=0; b<lookback; b++)
@@ -302,11 +341,34 @@ void ContagionFixedPoint()
 //+------------------------------------------------------------------+
 double GetATRValue(int idx)
 {
-   if(g_atrHandles[idx] == INVALID_HANDLE) return 0.0;
+   if(g_atrHandles[idx] == INVALID_HANDLE)
+   {
+      static bool warned[];
+      if(idx >= ArraySize(warned)) ArrayResize(warned, g_nSymbols);
+      if(!warned[idx])
+      {
+         warned[idx] = true;
+         Print("SystemicContagionEA: ATR handle invalid for basket symbol '", g_symbols[idx], "'.");
+      }
+      return 0.0;
+   }
 
    double buf[];
    ArraySetAsSeries(buf, true);
-   if(CopyBuffer(g_atrHandles[idx], 0, 0, 1, buf) <= 0) return 0.0;
+   int got = CopyBuffer(g_atrHandles[idx], 0, 0, 1, buf);
+   if(got <= 0)
+   {
+      static bool warnedBuf[];
+      if(idx >= ArraySize(warnedBuf)) ArrayResize(warnedBuf, g_nSymbols);
+      if(!warnedBuf[idx])
+      {
+         warnedBuf[idx] = true;
+         Print("SystemicContagionEA: ATR buffer not ready yet for '", g_symbols[idx],
+               "' (CopyBuffer returned ", got, "). This resolves itself once the ",
+               "indicator has enough history; the EA will keep retrying each bar.");
+      }
+      return 0.0;
+   }
    return buf[0];
 }
 
@@ -557,11 +619,26 @@ int OnInit()
 void OnTick()
 {
    static datetime lastBarTime = 0;
+   static int      barCounter  = 0;
+   static int      refreshFailCounter = 0;
+
    datetime curBarTime = iTime(_Symbol, InpTF, 0);
    if(curBarTime == lastBarTime) return; // act once per closed bar
    lastBarTime = curBarTime;
+   barCounter++;
 
-   if(!RefreshNetworkState()) return;
+   if(!RefreshNetworkState())
+   {
+      refreshFailCounter++;
+      // Throttled: print every 50 failed bars so the Journal isn't flooded, but the
+      // problem stays visible instead of the EA going completely silent.
+      if(refreshFailCounter % 50 == 1)
+         Print("SystemicContagionEA: RefreshNetworkState() has failed on ", refreshFailCounter,
+               " bar(s) so far (current bar time ", TimeToString(curBarTime),
+               "). See earlier warnings above for the specific symbol/reason. ",
+               "No trades can be evaluated until this resolves.");
+      return;
+   }
 
    double mySurv       = g_ownSurv[g_thisSymbolIndex];
    double myNetSurv    = g_netSurv[g_thisSymbolIndex];
@@ -578,6 +655,15 @@ void OnTick()
       "Min network threshold:  %.2f",
       _Symbol, mySurv, myNetSurv, (inverted?"YES (stress)":"no"),
       distressMult, InpMinNetworkSurv));
+
+   // Periodic numeric snapshot in the Journal (not just Comment(), which the Strategy
+   // Tester report does not capture), so the full time series can be inspected later.
+   if(barCounter % 200 == 1)
+      Print("SystemicContagionEA: [", TimeToString(curBarTime), "] ", _Symbol,
+            " ownSurv=", DoubleToString(mySurv,4),
+            " netSurv=", DoubleToString(myNetSurv,4),
+            " inverted=", (inverted?"yes":"no"),
+            " distressMult=", DoubleToString(distressMult,2));
 
    // --- Risk gate: paper's core message -- don't wait for an actual default ---
    if(myNetSurv < InpMinNetworkSurv)
