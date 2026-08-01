@@ -1,0 +1,53 @@
+# =========================================================
+# Configuración del paper trading en vivo
+# Parámetros = combinación ganadora de tu grid search
+# (num_levels=3, price_deviation=0.5, size_scaling=0.5, regrid=0.618)
+# =========================================================
+
+exchange:
+  base_url: "https://www.okx.com"
+  ws_public_url: "wss://ws.okx.com:8443/ws/v5/public"
+
+symbols:
+  - BTC-USDT
+  - ETH-USDT
+  - SOL-USDT
+  - XRP-USDT
+  - DOGE-USDT
+  - ADA-USDT
+  - AVAX-USDT
+  - LINK-USDT
+  - LTC-USDT
+  - POL-USDT
+  - BNB-USDT
+  - GRAM-USDT
+
+# Capital virtual (paper) asignado A CADA símbolo por separado, no total.
+# Así puedes comparar el rendimiento símbolo a símbolo de forma limpia.
+capital_per_symbol_usdt: 1000
+
+strategy:
+  num_levels: 3
+  price_deviation_multiplier: 0.5
+  size_scaling_factor: 0.5
+  regrid_threshold: 0.618
+  base_order_size_pct: 0.02
+  maker_fee: 0.0008
+  taker_fee: 0.001
+  slippage_bps: 2
+
+# Cada cuántos segundos se guarda un punto en la curva de equity (para no
+# saturar el CSV con un punto por cada tick)
+equity_snapshot_interval_sec: 60
+
+# Cada cuántos segundos se persiste el estado completo a disco (para poder
+# reanudar sin perder progreso si el proceso o el VPS se reinician)
+state_save_interval_sec: 30
+
+# Cada cuántos segundos se imprime (y se registra en summary_log.csv) un
+# resumen por símbolo con precio, equity, ROI %, PnL realizado, Sharpe y nº
+# de trades. 3600 = cada hora. Bájalo si quieres verlo más seguido en consola.
+summary_interval_sec: 3600
+
+state_dir: "paper_trading_state"
+logs_dir: "paper_trading_logs"
